@@ -1,0 +1,215 @@
+﻿#pragma kernel Skin
+#pragma kernel Place
+#pragma kernel Emit
+
+  struct Vert{
+    float3 pos;
+    float3 vel;
+    float3 nor;
+    float3 tang;
+    float2 uv;
+    float2 debug;
+  };
+
+
+struct Particle{
+  float3 pos;
+  float3 vel;
+  float3 nor;
+  float3 tan;
+  float2 uv;
+  float used;
+  float3 triIDs;
+  float3 triWeights;
+  float3 debug;
+};
+
+
+
+RWStructuredBuffer<Particle> _ParticleBuffer;
+RWStructuredBuffer<Vert> _VertBuffer;
+RWStructuredBuffer<Vert> _BaseBuffer;
+RWStructuredBuffer<float> _BlendWeightBuffer;
+
+int _ParticleBuffer_COUNT;
+int _VertBuffer_COUNT;
+int _BaseBuffer_COUNT;
+int _BlendWeightBuffer_COUNT;
+
+int safeID( int id , int max ){
+    return clamp( id , 0 , max );
+}
+
+
+
+#define NR_THREADS 128
+[numthreads(NR_THREADS,1,1)]
+void Skin (uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID) {
+
+  int pID = threadID + u3GroupID.x * NR_THREADS;
+
+  Vert vert = _VertBuffer[safeID( pID ,_VertBuffer_COUNT )];
+    Vert baseVert = _BaseBuffer[safeID( pID ,_VertBuffer_COUNT )];
+
+float3 fPos = baseVert.pos;
+float3 fNor = baseVert.nor;
+float3 fTan = baseVert.tang;
+
+  Vert vBlend;
+  float blendWeight;
+
+  for( int i = 0; i < _BlendWeightBuffer_COUNT; i++ ){
+
+    vBlend = _BaseBuffer[safeID( pID + (i+1) * _VertBuffer_COUNT ,_BaseBuffer_COUNT )];
+    blendWeight = _BlendWeightBuffer[i];
+
+    fPos += vBlend.pos * blendWeight; 
+    fTan += vBlend.tang * blendWeight; 
+    fNor += vBlend.nor * blendWeight; 
+
+
+  }
+
+
+// FOR EXACT SKINNING ( NO FORCES)
+vert.pos = fPos;
+vert.nor = normalize(fNor);
+vert.tang = normalize(fTan);
+vert.debug = 1;
+vert.uv = baseVert.uv;//vert.uv;
+
+  _VertBuffer[safeID(pID,_VertBuffer_COUNT)] = vert;
+
+}
+
+
+
+
+
+
+float _Time;
+
+float _OscillateSpeed;
+float _OscillateSize;
+float _BlinkSpeed;
+float _BlinkSize;
+
+#define NR_THREADS 128
+[numthreads(NR_THREADS,1,1)]
+void Place (uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID) {
+
+  int pID = threadID + u3GroupID.x * NR_THREADS;
+
+  if( pID < _ParticleBuffer_COUNT ){
+    
+    int sID = safeID( pID, _ParticleBuffer_COUNT );
+    Particle p = _ParticleBuffer[sID];
+
+    Vert v1 = _VertBuffer[safeID((int)p.triIDs.x, _VertBuffer_COUNT )];
+    Vert v2 = _VertBuffer[safeID((int)p.triIDs.y, _VertBuffer_COUNT )];
+    Vert v3 = _VertBuffer[safeID((int)p.triIDs.z, _VertBuffer_COUNT )];
+
+    p.pos = v1.pos * p.triWeights.x +  v2.pos * p.triWeights.y + v3.pos * p.triWeights.z;
+    p.nor = v1.nor * p.triWeights.x +  v2.nor * p.triWeights.y + v3.nor * p.triWeights.z;
+    p.tan = v1.tang * p.triWeights.x +  v2.tang * p.triWeights.y + v3.tang * p.triWeights.z;
+    p.uv  = v1.uv  * p.triWeights.x +  v2.uv  * p.triWeights.y + v3.uv  * p.triWeights.z;
+    p.vel = v1.vel  * p.triWeights.x +  v2.vel  * p.triWeights.y + v3.vel  * p.triWeights.z;
+
+    float h1 = sin( float(pID * 100000) + 39);
+    float h2 = sin( float(pID * 50000) + 20);
+    float h3 = sin( float(pID * 1000) + 10);
+    float h4 = sin( float(pID * 40000) + 10);
+    float3 bi = normalize(cross(p.tan,p.nor));
+    p.pos += (p.nor  * sin(_Time * (_OscillateSpeed + _OscillateSpeed * .5 * h1 )) * _OscillateSize);
+    p.pos += (p.tan  * sin(_Time * (_OscillateSpeed + _OscillateSpeed * .5 * h2 )) * _OscillateSize);
+    p.pos += (bi     * sin(_Time * (_OscillateSpeed + _OscillateSpeed * .5 * h3 )) * _OscillateSize);
+
+    p.debug.x = sin(_Time * (_BlinkSpeed + _BlinkSpeed * .5 * h4 )) * _BlinkSize;
+    //p.debug.xy  = v1.debug  * p.triWeights.x +  v2.debug  * p.triWeights.y + v3.debug  * p.triWeights.z;
+
+    _ParticleBuffer[sID] = p;
+
+
+  }
+}
+
+
+#include "snoise.cginc"
+#include "hash.cginc"
+#include "curlNoise.cginc"
+
+float4x4 _World;
+
+#define NR_THREADS 128
+[numthreads(NR_THREADS,1,1)]
+void Emit (uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID) {
+
+  int pID = threadID + u3GroupID.x * NR_THREADS;
+
+  if( pID < _ParticleBuffer_COUNT ){
+    
+    int sID = safeID( pID, _ParticleBuffer_COUNT );
+    Particle p = _ParticleBuffer[sID];
+
+    Vert v1 = _VertBuffer[safeID((int)p.triIDs.x, _VertBuffer_COUNT )];
+    Vert v2 = _VertBuffer[safeID((int)p.triIDs.y, _VertBuffer_COUNT )];
+    Vert v3 = _VertBuffer[safeID((int)p.triIDs.z, _VertBuffer_COUNT )];
+
+    float3 tPos = v1.pos * p.triWeights.x +  v2.pos * p.triWeights.y + v3.pos * p.triWeights.z;
+    float3 tNor = v1.nor * p.triWeights.x +  v2.nor * p.triWeights.y + v3.nor * p.triWeights.z;
+    p.tan = v1.tang * p.triWeights.x +  v2.tang * p.triWeights.y + v3.tang * p.triWeights.z;
+    p.uv  = v1.uv  * p.triWeights.x +  v2.uv  * p.triWeights.y + v3.uv  * p.triWeights.z;
+    float3 tVel = v1.vel  * p.triWeights.x +  v2.vel  * p.triWeights.y + v3.vel  * p.triWeights.z;
+
+
+    p.debug.y -= .001 * _BlinkSpeed * hash( float(pID * 20));
+    p.debug.y -= .001 * _BlinkSpeed * hash( float(pID * 23));
+    p.debug.y -= .001 * _BlinkSpeed * hash( float(pID * 21));
+//tPos += curlNoise( tPos * 3 + _Time * .2 ) * .1;
+tPos += tNor * snoise(tPos * .6) * .4;
+//tPos += tNor  * .2;
+    if( p.debug.y < 0  ){
+    
+      p.debug.y = 1;
+      
+      p.pos = mul(_World, float4(tPos,1)).xyz;
+      p.nor = mul(_World, float4(tNor,0)).xyz;
+      p.vel = tVel + p.nor * .001;
+
+      p.debug.x = 0;
+    }else{
+     // p.vel += curlNoise( p.pos * 3 + _Time * .2) *  .04;
+      
+      //p.vel += mul(_World, float4(p.tan,0)).xyz * 1;
+      p.vel +=(p.pos - mul(_World, float4(tPos,1)).xyz)* 1000.01;
+      p.pos += p.vel * .00001;
+      p.vel *= .94;
+//
+      p.debug.x = min( p.debug.y , (1.-p.debug.y) * 3) * 1;
+
+
+            //p.debug.y = 1;
+     p.pos = mul(_World, float4(tPos,1)).xyz;
+     p.nor = mul(_World, float4(tNor,0)).xyz;
+     p.vel = tVel + p.nor * .001;
+
+      //p.debug.x = 1;
+
+
+    }
+
+   // p.uv =  v1.uv;
+
+
+  
+    //p.debug.xy  = v1.debug  * p.triWeights.x +  v2.debug  * p.triWeights.y + v3.debug  * p.triWeights.z;
+
+    _ParticleBuffer[sID] = p;
+
+
+  }
+}
+
+
+
+

@@ -1,0 +1,332 @@
+﻿#pragma kernel Collision
+#pragma kernel Constraint
+#pragma kernel Resolve
+#pragma kernel CheapBasis
+#pragma kernel ParallelTransport
+#pragma kernel PlaceVerts
+
+
+float4x4 _Transform; 
+float _Delta;
+float _Time;
+uint _Pass;
+
+int _NumVertsPerRope;
+int _NumVerts;
+float3 _Gravity;
+float _Dampening;
+float3 _Forward;
+float _AnchorNormalForce;
+float _MaxForce;
+float _MaxVel;
+float _ForceMultiplier;
+float _NoisePower;
+float _NoiseSize;
+
+float _Radius;
+
+
+
+struct Rope{
+  float3 pos;
+  float3 oPos;
+  float3 tPos;
+  float3 nor;
+  float3 tang;
+  float2 uv;
+  float3 debug;
+};
+
+
+struct Vert{
+  float3 pos;
+  float3 nor;
+  float3 tan;
+  float3 ogPos;
+  float3 ogNor;
+  float3 ogTan;
+  float2 uv;
+  float4 debug;
+};
+
+
+
+
+RWStructuredBuffer<Rope> _RopeBuffer;
+RWStructuredBuffer<float4x4> _AnchorBuffer;
+RWStructuredBuffer<Vert> _VertBuffer;
+
+
+float3 getVel( float3 p1 , float3 p2 ){
+  float3 v = p1 - p2;
+  if( length( v ) > .5){ v = normalize( v ) *.5; }
+  return v;
+}
+
+#define NR_THREADS 128
+
+#include "snoise.cginc"
+#include "curlNoise.cginc"
+
+
+[numthreads(NR_THREADS,1,1)]
+void Collision (uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+
+  //int pID = id.x + id.y * gridX + id.z * gridX * gridY;
+
+  uint pID = threadID + u3GroupID.x * NR_THREADS;
+  uint bID = pID / _NumVertsPerRope;
+
+    Rope rope = _RopeBuffer[pID];
+    float4x4 anchor = _AnchorBuffer[bID];
+
+    float3 bP = mul( anchor , float4(0,0,0,1)).xyz; 
+    float3 bN = normalize(mul(anchor,float4(0,1,0,0)).xyz);
+
+    float3 force = _Gravity;
+
+    force += bN * _AnchorNormalForce;
+   
+   force += curlNoise( _NoiseSize * rope.pos ) * _NoisePower;
+
+
+    if( length( force ) > _MaxForce ){
+      force = normalize(force) * _MaxForce;
+    }
+ 
+
+    bool tb = false;
+
+    // If we are at the bottom, 
+    if( pID % _NumVertsPerRope == 0 ){ 
+      rope.pos = bP; 
+      rope.oPos = bP;
+      rope.tPos = bP;
+      tb = true;
+      rope.nor = bN;
+    }
+    
+
+
+
+    if( _Delta  < .1 && tb == false ){
+
+    // Inertia: objects in motion stay in motion.
+    float3 vel = getVel( rope.pos , rope.oPos);
+
+    if( length( vel ) > _MaxVel ){
+      vel = normalize(vel) * _MaxVel;
+    }
+
+
+      float3 next = rope.pos + vel  * _Dampening + force * _ForceMultiplier;
+
+      rope.oPos = rope.pos;
+      rope.pos = next;
+
+    }
+
+    _RopeBuffer[pID] = rope;
+
+  
+}
+
+
+
+float _RopeLength;
+
+[numthreads(NR_THREADS,1,1)]
+void Constraint(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+  
+    // Get the id using thread / group indices
+    
+    uint pID = threadID + u3GroupID.x * NR_THREADS ;
+
+    Rope rope = _RopeBuffer[pID];
+
+
+    float3 desiredPosition = rope.pos;
+    float3 desiredResolution = 0;
+    float numAdded = 0;
+    if( pID % _NumVertsPerRope != 0 ){
+        float3 pos = _RopeBuffer[pID-1].pos;
+        float3 dif = pos - rope.pos;
+        float l = length( dif );
+        float difference = 0;
+        if( l > 0.00001 ){
+            difference = ((_RopeLength/float(_NumVertsPerRope)) - l) / l;
+        }
+
+        float3 translate = dif * .5 * difference;
+        desiredResolution -=  translate;
+        numAdded += 1;
+
+    }
+
+    if( pID % _NumVertsPerRope != _NumVertsPerRope - 1 ){
+        float3 pos = _RopeBuffer[pID+1].pos;
+        float3 dif = pos - rope.pos;
+        float l = length( dif );
+        float difference = 0;
+        if( l > 0.00001 ){
+            difference = ((_RopeLength/float(_NumVertsPerRope)) - l) / l;
+        }
+
+        float3 translate = dif * .5 * difference;
+        desiredResolution -= translate;
+        numAdded += 1;
+
+    }
+
+  if( numAdded > 0 ){
+    desiredResolution /= numAdded;
+  }
+    rope.tPos = desiredPosition + desiredResolution;
+
+    _RopeBuffer[pID]= rope;
+
+
+    
+}
+
+
+[numthreads(NR_THREADS,1,1)]
+void Resolve(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+  
+    // Get the id using thread / group indices
+    
+    uint pID = threadID + u3GroupID.x * NR_THREADS ;
+
+    Rope rope = _RopeBuffer[pID];
+
+    rope.pos =  lerp( rope.pos , rope.tPos , 1);
+
+    _RopeBuffer[pID]= rope;
+
+    
+}
+
+
+
+
+
+[numthreads(NR_THREADS,1,1)]
+void CheapBasis(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+  
+    // Get the id using thread / group indices
+    
+    uint pID = threadID + u3GroupID.x * NR_THREADS ;
+
+
+float3 up;
+
+float3 nor;
+
+Rope rope = _RopeBuffer[pID];
+if( pID % _NumVertsPerRope != _NumVertsPerRope - 1  ){
+  nor = rope.pos - _RopeBuffer[pID +1].pos;
+}else{
+  nor =  _RopeBuffer[pID -1].pos-rope.pos;
+}
+nor = normalize( nor );
+
+float3 tang = normalize(cross( nor,_Forward));
+
+
+
+    rope.nor = nor;
+    rope.tang = tang;
+
+    _RopeBuffer[pID]= rope;
+
+    
+}
+
+
+[numthreads(NR_THREADS,1,1)]
+void ParallelTransport(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+  
+       uint pID = threadID + u3GroupID.x * NR_THREADS ;
+
+
+float3 up;
+
+float3 nor;
+
+Rope rope = _RopeBuffer[pID];
+if( pID % _NumVertsPerRope != _NumVertsPerRope - 1  ){
+  nor = rope.pos - _RopeBuffer[pID +1].pos;
+}else{
+  nor =  _RopeBuffer[pID -1].pos-rope.pos;
+}
+nor = normalize( nor );
+
+float3 tang = normalize(cross( nor, _Forward));
+
+
+
+    rope.nor = nor;
+    rope.tang = tang;
+
+    _RopeBuffer[pID]= rope;
+
+    
+}
+
+
+
+[numthreads(NR_THREADS,1,1)]
+void PlaceVerts(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID, uint3 id : SV_DispatchThreadID) {
+  
+       uint pID = threadID + u3GroupID.x * NR_THREADS ;
+
+ int vertID = pID % _NumVerts;
+ int ropeID = pID / _NumVerts;
+  Vert v = _VertBuffer[vertID];
+
+
+  float val = v.ogPos.y;
+
+  float ropeVal = float(_NumVertsPerRope-1) * val;
+
+  float bottom = floor( ropeVal );
+  float top = ceil( ropeVal);
+
+  float d  = ropeVal - bottom;
+
+  Rope rope1 = _RopeBuffer[int(bottom) + ropeID * _NumVertsPerRope];
+  Rope rope2 = _RopeBuffer[int(top)+ ropeID * _NumVertsPerRope];
+
+
+  float3 fPos = lerp(rope1.pos , rope2.pos,d);
+  float3 fNor = lerp(rope1.nor , rope2.nor,d);
+  float3 fTan = lerp(rope1.tang , rope2.tang,d);
+
+  float3 fBiTan = normalize(cross(fNor,fTan));
+  fTan = normalize(cross(fNor,fBiTan));
+
+
+
+  float3 finalVertPos =  fPos + fTan * v.ogPos.x * _Radius + fBiTan * v.ogPos.z  * _Radius;
+
+
+  v.pos = finalVertPos;
+  
+  _VertBuffer[pID]= v;
+
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
